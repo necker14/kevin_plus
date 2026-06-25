@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         成都职业培训网络学院 - 全自动刷课脚本
 // @namespace    https://www.cdwork.cn/
-// @version      1.5
+// @version      1.7
 // @description  自动播放视频、自动跳转下一节，直到所有培训课程全部学完。进入播放页自动启动。
 // @author       Auto Learning Script
 // @match        https://www.cdwork.cn/*
@@ -138,30 +138,82 @@
     }
 
     // ==================== 视频播放控制 ====================
-    function ensurePlaying() {
+
+    // 获取播放器暂停状态（兼容 TCPlayer API 和原生 video）
+    function getPausedState() {
+        const player = getPlayer();
+        const video = getVideoEl();
+        let isPaused = false;
+        let isEnded = false;
+
+        try {
+            if (player) {
+                isPaused = typeof player.paused === 'function' ? player.paused() : player.paused;
+                isEnded = typeof player.ended === 'function' ? player.ended() : player.ended;
+            } else if (video) {
+                isPaused = video.paused;
+                isEnded = video.ended;
+            }
+        } catch (e) {
+            if (video) {
+                isPaused = video.paused;
+                isEnded = video.ended;
+            }
+        }
+        return { isPaused, isEnded };
+    }
+
+    // 强制播放视频 — 多种策略确保视频开始播放
+    function forcePlay() {
         const player = getPlayer();
         const video = getVideoEl();
 
         if (!player && !video) return false;
 
+        const { isPaused, isEnded } = getPausedState();
+        if (!isPaused || isEnded) return false;
+
+        let played = false;
+
+        // 策略1: TCPlayer API
         try {
-            if (player) {
-                if (player.paused && !player.ended()) {
-                    player.play();
-                    log('视频已暂停，自动恢复播放', 'warn');
-                    return true;
+            if (player && typeof player.play === 'function') {
+                const result = player.play();
+                if (result && typeof result.catch === 'function') {
+                    result.catch(() => {});
                 }
-            } else if (video) {
-                if (video.paused && !video.ended) {
-                    video.play().catch(() => {});
-                    log('视频已暂停，自动恢复播放', 'warn');
-                    return true;
-                }
+                played = true;
             }
-        } catch (e) {
-            // 忽略
+        } catch (e) {}
+
+        // 策略2: 直接操作 video 元素
+        try {
+            if (video && video.paused) {
+                video.play().catch(() => {});
+                played = true;
+            }
+        } catch (e) {}
+
+        // 策略3: 模拟点击播放器区域的播放按钮
+        if (!played) {
+            const playBtn = document.querySelector('.vjs-big-play-button') ||
+                           document.querySelector('.vjs-play-control') ||
+                           document.querySelector('[class*="play"]');
+            if (playBtn) {
+                playBtn.click();
+                played = true;
+            }
         }
-        return false;
+
+        if (played) {
+            log('视频已暂停，自动恢复播放', 'warn');
+        }
+        return played;
+    }
+
+    // 兼容旧调用名
+    function ensurePlaying() {
+        return forcePlay();
     }
 
     // 防止暂停（覆盖visibilitychange处理）
@@ -173,7 +225,9 @@
                 // 即使页面不可见，也继续播放
                 const player = this.player;
                 if (player) {
-                    if (player.paused && !player.ended()) {
+                    const isPaused = typeof player.paused === 'function' ? player.paused() : player.paused;
+                    const isEnded = typeof player.ended === 'function' ? player.ended() : player.ended;
+                    if (isPaused && !isEnded) {
                         try { player.play(); } catch (e) {}
                     }
                 }
@@ -382,16 +436,11 @@
                 return;
             }
 
-            // 检查视频是否暂停
-            let isPaused = false;
-            if (player) {
-                isPaused = player.paused ? player.paused() : false;
-            } else if (video) {
-                isPaused = video.paused;
-            }
+            // 检查视频是否暂停 — 使用统一的 getPausedState
+            const pauseState = getPausedState();
 
-            if (isPaused && !isEnded) {
-                ensurePlaying();
+            if (pauseState.isPaused && !pauseState.isEnded) {
+                forcePlay();
             }
 
             // 更新进度信息
@@ -461,6 +510,9 @@
         // 启动主循环
         startMainLoop();
 
+        // 启动强制播放定时器，确保暂停的视频被恢复播放
+        setTimeout(() => startForcePlay(), 1000);
+
         // 立即执行一次
         setTimeout(mainLoop, 500);
 
@@ -471,7 +523,20 @@
         STATE.running = false;
         stopMainLoop();
         stopDialogCheck();
-        log('⏹️ 自动刷课已停止', 'warn');
+        stopForcePlay();
+
+        // 同时暂停视频播放
+        const player = getPlayer();
+        const video = getVideoEl();
+        try {
+            if (player && typeof player.pause === 'function') {
+                player.pause();
+            } else if (video) {
+                video.pause();
+            }
+        } catch (e) {}
+
+        log('⏹️ 自动刷课已停止，视频已暂停', 'warn');
         updateUI();
     }
 
@@ -495,7 +560,7 @@
                     color: #fff;
                     width: 320px;
                     overflow: hidden;
-                    transition: all 0.3s ease;
+                    transition: width 0.3s ease, height 0.3s ease, border-radius 0.3s ease;
                     backdrop-filter: blur(10px);
                 }
                 #cdwork-auto-ui.collapsed {
@@ -503,6 +568,9 @@
                     height: 48px !important;
                     border-radius: 50%;
                     cursor: pointer;
+                }
+                #cdwork-auto-ui.dragging {
+                    transition: none !important;
                 }
                 #cdwork-auto-ui.collapsed .panel-body { display: none !important; }
                 #cdwork-auto-ui.collapsed .panel-header { padding: 0 !important; justify-content: center !important; height: 48px !important; }
@@ -682,13 +750,16 @@
 
     function makeDraggable(panel, handle) {
         let isDragging = false;
-        let startX, startY, startLeft, startTop;
+        let startX = 0, startY = 0, startLeft = 0, startTop = 0;
 
         handle.addEventListener('mousedown', (e) => {
             // 点击按钮时不触发拖拽
             if (e.target.closest('.toggle-btn')) return;
             if (e.target.closest('.collapse-icon')) return;
+            if (e.button !== 0) return; // 只响应左键
+
             isDragging = true;
+            panel.classList.add('dragging'); // 拖拽时禁用所有过渡动画
             startX = e.clientX;
             startY = e.clientY;
             const rect = panel.getBoundingClientRect();
@@ -701,17 +772,23 @@
             e.preventDefault();
         });
 
-        document.addEventListener('mousemove', (e) => {
+        function onMove(e) {
             if (!isDragging) return;
             const dx = e.clientX - startX;
             const dy = e.clientY - startY;
+            // 直接同步设置位置，无过渡动画，零迟滞
             panel.style.left = Math.max(0, Math.min(window.innerWidth - 50, startLeft + dx)) + 'px';
             panel.style.top = Math.max(0, Math.min(window.innerHeight - 50, startTop + dy)) + 'px';
-        });
+        }
 
-        document.addEventListener('mouseup', () => {
+        function onUp() {
+            if (!isDragging) return;
             isDragging = false;
-        });
+            panel.classList.remove('dragging'); // 恢复过渡动画
+        }
+
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
     }
 
     function updateUI() {
@@ -769,6 +846,38 @@
     }
 
     // ==================== 初始化 ====================
+    let playForceTimer = null; // 强制播放定时器
+
+    // 启动强制播放定时器 — 持续尝试播放直到成功
+    function startForcePlay() {
+        if (playForceTimer) clearInterval(playForceTimer);
+        let forcePlayCount = 0;
+        playForceTimer = setInterval(() => {
+            forcePlayCount++;
+            const { isPaused, isEnded } = getPausedState();
+            if (isPaused && !isEnded) {
+                forcePlay();
+            } else if (!isPaused) {
+                // 视频已在播放，停止强制播放定时器
+                clearInterval(playForceTimer);
+                playForceTimer = null;
+                log('视频已开始播放', 'success');
+            }
+            // 最多尝试 30 次（60秒），之后也停止
+            if (forcePlayCount >= 30) {
+                clearInterval(playForceTimer);
+                playForceTimer = null;
+            }
+        }, 2000);
+    }
+
+    function stopForcePlay() {
+        if (playForceTimer) {
+            clearInterval(playForceTimer);
+            playForceTimer = null;
+        }
+    }
+
     function init() {
         // 只在学习/播放页面初始化
         const url = window.location.href;
@@ -790,28 +899,22 @@
             antiPause();
             startDialogCheck();
 
-            // 自动处理弹窗并尝试开始播放
-            setTimeout(() => {
-                handleDialogs();
-                const vm = getVueVM();
-                if (vm && vm.player) {
-                    // 尝试自动播放
-                    const player = vm.player;
-                    try {
-                        if (player.paused && player.paused()) {
-                            player.play();
-                        }
-                    } catch (e) {}
+            // 自动处理弹窗
+            handleDialogs();
 
-                    // 进入播放页自动启动刷课，无需手动点击
-                    if (!STATE.running) {
-                        log('检测到播放页面，3秒后自动开始刷课...', 'info');
-                        setTimeout(() => {
-                            if (!STATE.running) start();
-                        }, 3000);
-                    }
-                }
-            }, 2000);
+            // 进入播放页自动启动刷课，无需手动点击
+            // 注意：不再依赖 vm.player 是否存在，即使播放器还没准备好也启动
+            // 主循环会持续检测播放器并尝试播放
+            if (!STATE.running) {
+                log('检测到播放页面，自动开始刷课...', 'info');
+                start();
+            }
+
+            // 额外启动一个强制播放定时器，专门负责把暂停的视频播放起来
+            // 它独立于主循环，更频繁地尝试播放
+            setTimeout(() => {
+                startForcePlay();
+            }, 3000);
         }, 2000);
     }
 
